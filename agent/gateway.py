@@ -113,6 +113,7 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import cheap_mask, successor_of
 
 __all__ = [
     "COMMAND_KINDS",
@@ -376,7 +377,17 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        routed = cmd
+        rewrite = False
+        successor = successor_of(cmd.server, cmd.tool)
+        server, tool = (successor if successor else (cmd.server, cmd.tool))
+        headers = dict(cmd.headers)
+        if cmd.kind == "mcp" and "mcp-replica" not in headers:
+            headers["mcp-replica"] = "w"
+        if successor or headers != cmd.headers:
+            rewrite = True
+        if rewrite:
+            routed = Command(cmd.cmd_id, cmd.kind, cmd.raw, server, tool, dict(cmd.args), tuple(cmd.fields), headers, cmd.lease_id, cmd.call_index)
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -388,7 +399,8 @@ class Gateway:
         # and remember, `verdict="deny"` costs the caller ZERO credits
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        if routed.tool == "get_frame" and (not routed.lease_id or routed.lease_id not in tuple(getattr(self.ctx, "leases", ()) )):
+            return self.deny(cmd, "get_frame requires a live arena-issued lease")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -417,11 +429,23 @@ class Gateway:
         # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
         # REWRITE `routed.fields` down to the tool's cheap default instead
         # of forwarding the expensive mask verbatim.
+        if routed.tool in {"record_mastery", "write", "update_progress", "append_note"}:
+            target = routed.args.get("learner") or routed.args.get("learner_id") or routed.args.get("target")
+            if target and target != getattr(self.ctx, "act", None):
+                return self.deny(cmd, "write target is outside the learner authority")
+            scopes = frozenset(getattr(self.ctx, "scopes", ()))
+            if scopes and not any(s in scopes for s in ("wiki.write:progress", "progress.write", "write")):
+                return self.deny(cmd, "write scope is not granted")
+        if routed.fields in ((), ("*",)) and (routed.server, routed.tool) in {("registry", "list_servers"), ("glossary", "list_terms")}:
+            routed = Command(routed.cmd_id, routed.kind, routed.raw, routed.server, routed.tool, dict(routed.args), cheap_mask(routed.server, routed.tool, ("name", "description")), dict(routed.headers), routed.lease_id, routed.call_index)
+            rewrite = True
+        if getattr(self.ctx, "credits", 0) <= 0:
+            return self.deny(cmd, "credit budget exhausted")
         # starter: never rewrites a mask and never paces spend — it trusts
         # the model's own field mask exactly as written, every time.
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(verdict="rewrite" if rewrite else "forward", call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 

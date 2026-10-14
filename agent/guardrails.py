@@ -177,7 +177,19 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    if not isinstance(text, str) or not text:
+        return InjectionScanResult(False, ())
+    patterns = (
+        r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions",
+        r"(?:system|developer)\s+(?:message|prompt)\s+override",
+        r"(?:you\s+are|this\s+is)\s+the\s+system",
+        r"reveal\s+(?:your|the)\s+(?:act|scope|scopes|system prompt)",
+        r"follow\s+these\s+instructions",
+        r"disregard\s+(?:the|your)\s+(?:rules|instructions)",
+    )
+    lowered = text.casefold()
+    hits = tuple(p for p in patterns if re.search(p, lowered, re.I))
+    return InjectionScanResult(bool(hits), hits)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +217,13 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    if not isinstance(text, str):
+        return RedactionResult("", ())
+    # Redact long private-record-shaped lines while preserving the surrounding answer.
+    private = re.compile(r"(?im)(?:learner|private\s+note|private\s+field)\b[^\n]{40,}")
+    hits = tuple(m.group(0) for m in private.finditer(text))
+    redacted = private.sub("[REDACTED PRIVATE CONTENT]", text)
+    return RedactionResult(redacted, hits)
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +256,18 @@ def verify_arithmetic(text: str) -> ArithmeticCheckResult:
     This starter's version does not look at `text` at all beyond what
     `_NUMBER_RE` would find if you called it (it isn't called) — see this
     file's own `__main__` demo below."""
-    return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
-    )
+    if not isinstance(text, str):
+        return ArithmeticCheckResult(True, False, "text is not a string")
+    nums = _NUMBER_RE.findall(text)
+    if not nums:
+        return ArithmeticCheckResult(True, True, "no numeric claims")
+    # Without the retrieved source this helper can only certify conservative
+    # integer/round-number claims; callers should pass source-backed numbers
+    # through their own comparison before accepting precise values.
+    precise = [n for n in nums if "." in n and len(n.rsplit(".", 1)[1]) > 1]
+    if precise:
+        return ArithmeticCheckResult(True, False, "precise numeric claims require source verification")
+    return ArithmeticCheckResult(True, True, "numeric claims are coarse and require source comparison")
 
 
 # ---------------------------------------------------------------------------
